@@ -14,6 +14,7 @@ Env vars:
   TELEGRAM_CHAT_ID    - defaults to 6249557228 (Imran)
   MODEL_NAME          - defaults to gemini-2.5-flash
 """
+import asyncio
 import os
 import re
 
@@ -94,14 +95,16 @@ async def send_telegram_lead(lead: dict):
     if lead["notes"]:
         lines.append(f"📝 {lead['notes']}")
     try:
-        async with httpx.AsyncClient(timeout=15) as c:
+        # trust_env=False: poisoned proxy env vars must never break alerts
+        async with httpx.AsyncClient(timeout=15, trust_env=False) as c:
             await c.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                 json={"chat_id": TELEGRAM_CHAT_ID,
                       "text": "\n".join(lines), "parse_mode": "HTML"},
             )
-    except Exception:
-        pass  # lead alert must never break the chat reply
+    except Exception as e:
+        print(f"[chatbot] telegram alert failed: {type(e).__name__}: {e}",
+              flush=True)
 
 
 # ---------------- gemini ----------------
@@ -126,13 +129,25 @@ async def ask_gemini(history: list[dict], context: str, user_msg: str) -> str:
         "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024,
                              "thinkingConfig": {"thinkingBudget": 0}},
     }
-    async with httpx.AsyncClient(timeout=90) as c:
-        r = await c.post(url, params={"key": GEMINI_API_KEY}, json=body)
-        r.raise_for_status()
-        data = r.json()
-    # join ALL response parts — taking only parts[0] truncates mid-sentence
-    parts = data["candidates"][0]["content"]["parts"]
-    return "".join(p.get("text", "") for p in parts).strip()
+    # trust_env=False: host proxy env vars (e.g. unparsable NO_PROXY entries)
+    # must never break API calls. One retry on transient 429/5xx.
+    async with httpx.AsyncClient(timeout=90, trust_env=False) as c:
+        last_err: Exception | None = None
+        for attempt in range(2):
+            try:
+                r = await c.post(url, params={"key": GEMINI_API_KEY}, json=body)
+                r.raise_for_status()
+                data = r.json()
+                parts = data["candidates"][0]["content"]["parts"]
+                return "".join(p.get("text", "") for p in parts).strip()
+            except httpx.HTTPStatusError as e:
+                last_err = e
+                code = e.response.status_code
+                if code in (429, 500, 502, 503) and attempt == 0:
+                    await asyncio.sleep(2)
+                    continue
+                raise
+        raise last_err  # pragma: no cover
 
 
 FALLBACK = ("দুঃখিত, এই মুহূর্তে উত্তর দিতে পারছি না। "
@@ -164,7 +179,9 @@ async def chat(body: ChatIn, bg: BackgroundTasks):
     context = "\n".join(retrieve(msg)) or "No directly matching knowledge base entry."
     try:
         raw = await ask_gemini(hist, context, msg)
-    except Exception:
+    except Exception as e:
+        # logged to Render logs — silent fallback was hiding real bugs
+        print(f"[chatbot] ask_gemini failed: {type(e).__name__}: {e}", flush=True)
         return JSONResponse({"reply": FALLBACK})
 
     reply, lead = extract_lead(raw)
