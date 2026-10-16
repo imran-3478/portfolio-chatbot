@@ -130,10 +130,12 @@ async def ask_gemini(history: list[dict], context: str, user_msg: str) -> str:
                              "thinkingConfig": {"thinkingBudget": 0}},
     }
     # trust_env=False: host proxy env vars (e.g. unparsable NO_PROXY entries)
-    # must never break API calls. One retry on transient 429/5xx.
+    # must never break API calls. Patient retries: the free tier allows only a
+    # few requests per minute, so back off respectfully on 429/5xx.
     async with httpx.AsyncClient(timeout=90, trust_env=False) as c:
+        backoffs = [5, 15, 30]
         last_err: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(1 + len(backoffs)):
             try:
                 r = await c.post(url, params={"key": GEMINI_API_KEY}, json=body)
                 r.raise_for_status()
@@ -143,8 +145,15 @@ async def ask_gemini(history: list[dict], context: str, user_msg: str) -> str:
             except httpx.HTTPStatusError as e:
                 last_err = e
                 code = e.response.status_code
-                if code in (429, 500, 502, 503) and attempt == 0:
-                    await asyncio.sleep(2)
+                if code in (429, 500, 502, 503) and attempt < len(backoffs):
+                    wait = backoffs[attempt]
+                    try:
+                        wait = max(wait, int(e.response.headers.get("retry-after", 0)))
+                    except (TypeError, ValueError):
+                        pass
+                    print(f"[chatbot] Gemini {code}, retrying in {wait}s "
+                          f"(attempt {attempt + 1})", flush=True)
+                    await asyncio.sleep(wait)
                     continue
                 raise
         raise last_err  # pragma: no cover
