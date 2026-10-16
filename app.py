@@ -27,7 +27,7 @@ from knowledge import KB_SECTIONS, SYSTEM_PROMPT
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "6249557228").strip()
-MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-2.5-flash").strip()
+MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-3.5-flash").strip()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app = FastAPI(title="Portfolio AI Chatbot")
