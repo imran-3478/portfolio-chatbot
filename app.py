@@ -120,7 +120,11 @@ async def ask_gemini(history: list[dict], context: str, user_msg: str) -> str:
     body = {
         "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
         "contents": contents,
-        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 400},
+        # thinkingBudget 0: hidden reasoning eats the token budget and truncates
+        # replies (finishReason MAX_TOKENS with ~380 thought tokens). Not needed
+        # for FAQ answers — disable for complete, faster, cheaper replies.
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024,
+                             "thinkingConfig": {"thinkingBudget": 0}},
     }
     async with httpx.AsyncClient(timeout=90) as c:
         r = await c.post(url, params={"key": GEMINI_API_KEY}, json=body)
