@@ -126,7 +126,9 @@ async def ask_gemini(history: list[dict], context: str, user_msg: str) -> str:
         r = await c.post(url, params={"key": GEMINI_API_KEY}, json=body)
         r.raise_for_status()
         data = r.json()
-    return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    # join ALL response parts — taking only parts[0] truncates mid-sentence
+    parts = data["candidates"][0]["content"]["parts"]
+    return "".join(p.get("text", "") for p in parts).strip()
 
 
 FALLBACK = ("দুঃখিত, এই মুহূর্তে উত্তর দিতে পারছি না। "
