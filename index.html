@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>ইমরানের AI অ্যাসিস্ট্যান্ট</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:'Hind Siliguri','Noto Sans Bengali',system-ui,sans-serif; background:#f0f4f1; height:100dvh; display:flex; flex-direction:column; }
+  header { background:linear-gradient(135deg,#0d7a3f,#0a5c30); color:#fff; padding:14px 16px; display:flex; align-items:center; gap:12px; box-shadow:0 2px 8px rgba(0,0,0,.15); }
+  header .avatar { width:44px; height:44px; border-radius:50%; background:#fff; display:flex; align-items:center; justify-content:center; font-size:24px; }
+  header h1 { font-size:17px; font-weight:700; }
+  header p { font-size:12px; opacity:.85; }
+  header .dot { width:9px; height:9px; border-radius:50%; background:#4ade80; display:inline-block; margin-right:4px; animation:pulse 2s infinite; }
+  @keyframes pulse { 50% { opacity:.4; } }
+  #msgs { flex:1; overflow-y:auto; padding:14px 12px; display:flex; flex-direction:column; gap:10px; }
+  .msg { max-width:82%; padding:10px 13px; border-radius:16px; font-size:15px; line-height:1.55; white-space:pre-wrap; word-wrap:break-word; }
+  .bot { background:#fff; align-self:flex-start; border-bottom-left-radius:4px; box-shadow:0 1px 3px rgba(0,0,0,.1); }
+  .user { background:#0d7a3f; color:#fff; align-self:flex-end; border-bottom-right-radius:4px; }
+  .typing { display:flex; gap:5px; padding:14px 16px; }
+  .typing span { width:8px; height:8px; border-radius:50%; background:#999; animation:tp 1.2s infinite; }
+  .typing span:nth-child(2){ animation-delay:.2s; } .typing span:nth-child(3){ animation-delay:.4s; }
+  @keyframes tp { 40% { transform:translateY(-6px); } }
+  #chips { display:flex; gap:8px; padding:8px 12px; overflow-x:auto; background:#f0f4f1; }
+  .chip { flex-shrink:0; border:1.5px solid #0d7a3f; color:#0d7a3f; background:#fff; border-radius:20px; padding:7px 14px; font-size:13px; cursor:pointer; font-family:inherit; }
+  .chip:active { background:#0d7a3f; color:#fff; }
+  #bar { display:flex; gap:8px; padding:10px 12px calc(10px + env(safe-area-inset-bottom)); background:#fff; border-top:1px solid #e0e0e0; }
+  #inp { flex:1; border:1.5px solid #ddd; border-radius:24px; padding:11px 16px; font-size:15px; font-family:inherit; outline:none; }
+  #inp:focus { border-color:#0d7a3f; }
+  #send { width:48px; height:48px; border-radius:50%; border:none; background:#0d7a3f; color:#fff; font-size:20px; cursor:pointer; flex-shrink:0; }
+  #send:disabled { opacity:.5; }
+</style>
+</head>
+<body>
+<header>
+  <div class="avatar">🤖</div>
+  <div><h1>ইমরানের AI অ্যাসিস্ট্যান্ট</h1><p><span class="dot"></span>অনলাইন — সাথে সাথে উত্তর দেয়</p></div>
+</header>
+<div id="msgs"></div>
+<div id="chips">
+  <button class="chip">সার্ভিসগুলো কী কী?</button>
+  <button class="chip">Meta Pixel-এর দাম কত?</button>
+  <button class="chip">ওয়েবসাইট বানাতে কতদিন লাগে?</button>
+  <button class="chip">যোগাযোগ করবো কীভাবে?</button>
+</div>
+<div id="bar">
+  <input id="inp" placeholder="তোমার প্রশ্ন লিখো…" autocomplete="off">
+  <button id="send" title="পাঠাও">➤</button>
+</div>
+<script>
+const msgs = document.getElementById('msgs'), inp = document.getElementById('inp'), sendBtn = document.getElementById('send');
+let sid = localStorage.getItem('pcb_sid');
+if (!sid) { sid = 's' + Math.random().toString(36).slice(2, 12); localStorage.setItem('pcb_sid', sid); }
+
+function addMsg(text, cls) {
+  const d = document.createElement('div');
+  d.className = 'msg ' + cls; d.textContent = text;
+  msgs.appendChild(d); msgs.scrollTop = msgs.scrollHeight;
+  return d;
+}
+function setTyping(on) {
+  let t = document.getElementById('typing');
+  if (on && !t) { t = document.createElement('div'); t.id = 'typing'; t.className = 'msg bot typing'; t.innerHTML = '<span></span><span></span><span></span>'; msgs.appendChild(t); msgs.scrollTop = msgs.scrollHeight; }
+  if (!on && t) t.remove();
+}
+async function send(text) {
+  text = (text || inp.value).trim();
+  if (!text || sendBtn.disabled) return;
+  inp.value = '';
+  addMsg(text, 'user');
+  sendBtn.disabled = true; setTyping(true);
+  try {
+    const r = await fetch('/api/chat', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({message:text, session_id:sid})
+    });
+    const j = await r.json();
+    setTyping(false);
+    addMsg(j.reply || 'দুঃখিত, আবার চেষ্টা করো।', 'bot');
+  } catch(e) {
+    setTyping(false);
+    addMsg('সার্ভার জেগে উঠছে… ১০ সেকেন্ড পর আবার পাঠাও 🙏', 'bot');
+  }
+  sendBtn.disabled = false;
+}
+sendBtn.onclick = () => send();
+inp.onkeydown = e => { if (e.key === 'Enter') send(); };
+document.querySelectorAll('.chip').forEach(c => c.onclick = () => send(c.textContent));
+addMsg('আসসালামু আলাইকুম! 👋 আমি ইমরানের AI অ্যাসিস্ট্যান্ট।\nসার্ভিস, দাম, বা যেকোনো প্রশ্ন করতে পারো — বাংলায় বা English-এ!', 'bot');
+</script>
+</body>
+</html>
