@@ -5,8 +5,11 @@ Replaces the n8n "Portfolio AI Chatbot" workflow (which kept OOM-crashing the
 
 Flow per message:
   1. Keyword retrieval over the local knowledge base (zero API cost)
-  2. Gemini generates the reply with KB context + short session history
+  2. Gemini generates the reply with KB context + short session history,
+     and may call TOOLS (agentic loop): generate_quote, search_projects,
+     check_availability, request_meeting
   3. [LEAD] marker parsed -> Telegram alert to Imran (fire-and-forget)
+  4. Meeting request -> Telegram alert to Imran (fire-and-forget)
 
 Env vars:
   GEMINI_API_KEY      - Google AI Studio key (required)
@@ -24,7 +27,7 @@ from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from knowledge import KB_SECTIONS, SYSTEM_PROMPT
+from knowledge import KB_SECTIONS, SYSTEM_PROMPT, PRICING, PROJECTS, AVAILABILITY
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -135,8 +138,181 @@ async def send_telegram_lead(lead: dict):
               flush=True)
 
 
-# ---------------- gemini ----------------
-async def ask_gemini(history: list[dict], context: str, user_msg: str) -> str:
+async def send_telegram_meeting(meeting: dict):
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    lines = ["📅 <b>New Meeting Request!</b>", ""]
+    if meeting.get("name"):
+        lines.append(f"👤 <b>{meeting['name']}</b>")
+    lines.append(f"📞 <code>{meeting.get('phone', '')}</code>")
+    lines.append(f"🕗 Preferred: {meeting.get('preferred_time', '')}")
+    if meeting.get("topic"):
+        lines.append(f"💬 Topic: {meeting['topic']}")
+    try:
+        async with httpx.AsyncClient(timeout=15, trust_env=False) as c:
+            await c.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID,
+                      "text": "\n".join(lines), "parse_mode": "HTML"},
+            )
+    except Exception as e:
+        print(f"[chatbot] telegram meeting alert failed: {type(e).__name__}: {e}",
+              flush=True)
+
+
+# ---------------- agentic tools (Gemini function calling) ----------------
+# The model decides WHEN to call these — that is what makes the bot agentic
+# rather than a hardcoded script. All data is deterministic (from knowledge.py)
+# so the bot can never hallucinate prices, projects or availability.
+
+FUNCTION_DECLARATIONS = [
+    {
+        "name": "generate_quote",
+        "description": ("Get Imran's official price range, timeline and what's included "
+                        "for a service. ALWAYS use this when the visitor asks about "
+                        "price/cost — never quote from memory."),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "service": {
+                    "type": "string",
+                    "description": ("One of: meta_pixel, flutter_app, ai_chatbot, "
+                                    "ai_video_ad, website, brand_design, content_seo"),
+                },
+                "requirements": {
+                    "type": "string",
+                    "description": "Short summary of what the visitor needs",
+                },
+            },
+            "required": ["service"],
+        },
+    },
+    {
+        "name": "search_projects",
+        "description": ("Search Imran's past projects. Use when the visitor asks about "
+                        "past work, portfolio or examples."),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "What kind of project the visitor is asking about",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "check_availability",
+        "description": ("Get Imran's free hours for calls/meetings. Call this FIRST when "
+                        "the visitor wants to talk, meet or call Imran."),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "request_meeting",
+        "description": ("Send Imran a meeting request (he gets a Telegram alert and "
+                        "personally confirms). Call ONLY when you have the visitor's "
+                        "name, phone number AND preferred time — ask first if missing."),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Visitor's name"},
+                "phone": {"type": "string", "description": "Visitor's phone/WhatsApp number"},
+                "preferred_time": {"type": "string", "description": "When they want to talk, e.g. 'Friday 4pm'"},
+                "topic": {"type": "string", "description": "What they want to discuss"},
+            },
+            "required": ["name", "phone", "preferred_time"],
+        },
+    },
+]
+
+
+def handle_generate_quote(args: dict) -> dict:
+    service = (args.get("service") or "").strip()
+    req = (args.get("requirements") or "").strip()
+    info = PRICING.get(service)
+    if not info:
+        return {"ok": False,
+                "error": f"Unknown service '{service}'. Valid: {', '.join(sorted(PRICING))}"}
+    return {"ok": True, "service": info["label"], "price": info["price"],
+            "timeline": info["timeline"], "includes": info["includes"],
+            "requirements": req, "payment": "50% advance to start"}
+
+
+def handle_search_projects(args: dict) -> dict:
+    q = (args.get("query") or "").strip()
+    qt = set(tokenize(q))
+    scored = []
+    for p in PROJECTS:
+        hay = f"{p['name']} {p['desc']} {p['tech']} {p['highlights']}".lower()
+        score = sum(1 for t in qt if t in hay)
+        scored.append((score, p))
+    scored.sort(key=lambda x: -x[0])
+    top = [p for s, p in scored[:3] if s > 0] or PROJECTS[:3]
+    return {"ok": True, "projects": top}
+
+
+def handle_check_availability(args: dict) -> dict:
+    return {"ok": True, "availability": AVAILABILITY["summary"],
+            "note": AVAILABILITY["note"]}
+
+
+def handle_request_meeting(args: dict) -> dict:
+    name = (args.get("name") or "").strip()
+    phone = (args.get("phone") or "").strip()
+    when = (args.get("preferred_time") or "").strip()
+    topic = (args.get("topic") or "").strip()
+    missing = [k for k, v in (("name", name), ("phone", phone),
+                              ("preferred_time", when)) if not v]
+    if missing:
+        return {"ok": False,
+                "error": f"Missing: {', '.join(missing)}. Ask the visitor first."}
+    return {"ok": True,
+            "meeting": {"name": name, "phone": phone,
+                        "preferred_time": when, "topic": topic},
+            "message": "Meeting request sent to Imran. He will personally confirm the slot."}
+
+
+TOOL_HANDLERS = {
+    "generate_quote": handle_generate_quote,
+    "search_projects": handle_search_projects,
+    "check_availability": handle_check_availability,
+    "request_meeting": handle_request_meeting,
+}
+
+
+# ---------------- gemini (agentic loop) ----------------
+async def _gemini_post(c: httpx.AsyncClient, url: str, body: dict) -> dict:
+    # trust_env=False: host proxy env vars (e.g. unparsable NO_PROXY entries)
+    # must never break API calls. Patient retries: the free tier allows only a
+    # few requests per minute, so back off respectfully on 429/5xx.
+    backoffs = [5, 15, 30]
+    last_err: Exception | None = None
+    for attempt in range(1 + len(backoffs)):
+        try:
+            r = await c.post(url, params={"key": GEMINI_API_KEY}, json=body)
+            r.raise_for_status()
+            return r.json()
+        except httpx.HTTPStatusError as e:
+            last_err = e
+            code = e.response.status_code
+            if code in (429, 500, 502, 503) and attempt < len(backoffs):
+                wait = backoffs[attempt]
+                try:
+                    wait = max(wait, int(e.response.headers.get("retry-after", 0)))
+                except (TypeError, ValueError):
+                    pass
+                print(f"[chatbot] Gemini {code}, retrying in {wait}s "
+                      f"(attempt {attempt + 1})", flush=True)
+                await asyncio.sleep(wait)
+                continue
+            raise
+    raise last_err  # pragma: no cover
+
+
+async def ask_gemini(history: list[dict], context: str, user_msg: str):
+    """Agentic loop: the model may call tools; results feed back for the
+    final reply. Returns (reply_text, tools_used, meeting|None)."""
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
            f"{MODEL_NAME}:generateContent")
     contents = []
@@ -151,40 +327,48 @@ async def ask_gemini(history: list[dict], context: str, user_msg: str) -> str:
     body = {
         "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
         "contents": contents,
+        "tools": [{"functionDeclarations": FUNCTION_DECLARATIONS}],
         # thinkingBudget 0: hidden reasoning eats the token budget and truncates
         # replies (finishReason MAX_TOKENS with ~380 thought tokens). Not needed
         # for FAQ answers — disable for complete, faster, cheaper replies.
         "generationConfig": {"temperature": 0.7, "maxOutputTokens": 700,
                              "thinkingConfig": {"thinkingBudget": 0}},
     }
-    # trust_env=False: host proxy env vars (e.g. unparsable NO_PROXY entries)
-    # must never break API calls. Patient retries: the free tier allows only a
-    # few requests per minute, so back off respectfully on 429/5xx.
+    meeting = None
+    tools_used = False
     async with httpx.AsyncClient(timeout=90, trust_env=False) as c:
-        backoffs = [5, 15, 30]
-        last_err: Exception | None = None
-        for attempt in range(1 + len(backoffs)):
-            try:
-                r = await c.post(url, params={"key": GEMINI_API_KEY}, json=body)
-                r.raise_for_status()
-                data = r.json()
-                parts = data["candidates"][0]["content"]["parts"]
-                return "".join(p.get("text", "") for p in parts).strip()
-            except httpx.HTTPStatusError as e:
-                last_err = e
-                code = e.response.status_code
-                if code in (429, 500, 502, 503) and attempt < len(backoffs):
-                    wait = backoffs[attempt]
-                    try:
-                        wait = max(wait, int(e.response.headers.get("retry-after", 0)))
-                    except (TypeError, ValueError):
-                        pass
-                    print(f"[chatbot] Gemini {code}, retrying in {wait}s "
-                          f"(attempt {attempt + 1})", flush=True)
-                    await asyncio.sleep(wait)
-                    continue
-                raise
-        raise last_err  # pragma: no cover
+        # trust_env=False: poisoned proxy env vars must never break API calls
+        for _round in range(3):  # tool rounds: call -> result -> final answer
+            data = await _gemini_post(c, url, body)
+            content = data["candidates"][0]["content"]
+            parts = content.get("parts", [])
+            body["contents"].append(content)  # keep the model turn for next round
+            calls = [p.get("functionCall") for p in parts if p.get("functionCall")]
+            if not calls:
+                text = "".join(p.get("text", "") for p in parts).strip()
+                return text, tools_used, meeting
+            tools_used = True
+            for fc in calls:
+                name = fc.get("name", "")
+                args = fc.get("args", {}) or {}
+                handler = TOOL_HANDLERS.get(name)
+                try:
+                    result = handler(args) if handler else \
+                        {"ok": False, "error": f"Unknown tool: {name}"}
+                except Exception as e:
+                    result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+                print(f"[chatbot] tool call: {name} args={args} ok={result.get('ok')}",
+                      flush=True)
+                if name == "request_meeting" and result.get("ok"):
+                    meeting = result["meeting"]
+                body["contents"].append({
+                    "role": "function",
+                    "parts": [{"functionResponse": {"name": name,
+                                                    "response": result}}],
+                })
+    # 3 rounds exhausted without a final answer — shouldn't happen
+    print("[chatbot] agentic loop exhausted rounds", flush=True)
+    return FALLBACK, tools_used, meeting
 
 
 FALLBACK = ("দুঃখিত, এই মুহূর্তে উত্তর দিতে পারছি না। "
@@ -215,16 +399,18 @@ async def chat(body: ChatIn, bg: BackgroundTasks):
 
     context = "\n".join(retrieve(msg)) or "No directly matching knowledge base entry."
     # Fresh conversation? Serve repeat questions from cache (instant, no quota burn).
+    # Never cache turns where tools ran (availability/meeting data is live).
     use_cache = len(hist) <= 2
     raw = cache_get(msg) if use_cache else None
+    meeting = None
     if raw is None:
         try:
-            raw = await ask_gemini(hist, context, msg)
+            raw, tools_used, meeting = await ask_gemini(hist, context, msg)
         except Exception as e:
             # logged to Render logs — silent fallback was hiding real bugs
             print(f"[chatbot] ask_gemini failed: {type(e).__name__}: {e}", flush=True)
             return JSONResponse({"reply": FALLBACK})
-        if use_cache:
+        if use_cache and not tools_used:
             cache_put(msg, raw)
     else:
         print("[chatbot] cache hit", flush=True)
@@ -236,4 +422,6 @@ async def chat(body: ChatIn, bg: BackgroundTasks):
 
     if lead:
         bg.add_task(send_telegram_lead, lead)
+    if meeting:
+        bg.add_task(send_telegram_meeting, meeting)
     return {"reply": reply or FALLBACK}
