@@ -17,6 +17,7 @@ Env vars:
 import asyncio
 import os
 import re
+import time as _time
 
 import httpx
 from fastapi import FastAPI, BackgroundTasks
@@ -35,6 +36,33 @@ app = FastAPI(title="Portfolio AI Chatbot")
 
 # session_id -> [{"role": "user"|"model", "text": ...}]  (in-memory, free-tier OK)
 sessions: dict[str, list[dict]] = {}
+
+# ---------------- reply cache ----------------
+# FAQ bot: visitors ask the same questions repeatedly. Cache the raw Gemini
+# response per normalized message (1h TTL) so repeats answer instantly AND
+# don't burn the ~20 req/day free quota. Only used for fresh conversations
+# (<=2 prior exchanges) where the reply doesn't depend on long history.
+# extract_lead still runs on the cached raw text, so Telegram lead alerts
+# keep working on cache hits.
+_CACHE_TTL = 3600
+_reply_cache: dict[str, tuple[float, str]] = {}
+
+
+def _cache_key(msg: str) -> str:
+    return " ".join(msg.lower().split())[:200]
+
+
+def cache_get(msg: str) -> str | None:
+    hit = _reply_cache.get(_cache_key(msg))
+    if hit and _time.time() - hit[0] < _CACHE_TTL:
+        return hit[1]
+    return None
+
+
+def cache_put(msg: str, raw: str) -> None:
+    if len(_reply_cache) > 300:
+        _reply_cache.clear()
+    _reply_cache[_cache_key(msg)] = (_time.time(), raw)
 
 
 class ChatIn(BaseModel):
@@ -126,7 +154,7 @@ async def ask_gemini(history: list[dict], context: str, user_msg: str) -> str:
         # thinkingBudget 0: hidden reasoning eats the token budget and truncates
         # replies (finishReason MAX_TOKENS with ~380 thought tokens). Not needed
         # for FAQ answers — disable for complete, faster, cheaper replies.
-        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 1024,
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 700,
                              "thinkingConfig": {"thinkingBudget": 0}},
     }
     # trust_env=False: host proxy env vars (e.g. unparsable NO_PROXY entries)
@@ -186,12 +214,20 @@ async def chat(body: ChatIn, bg: BackgroundTasks):
         return JSONResponse({"reply": FALLBACK})
 
     context = "\n".join(retrieve(msg)) or "No directly matching knowledge base entry."
-    try:
-        raw = await ask_gemini(hist, context, msg)
-    except Exception as e:
-        # logged to Render logs — silent fallback was hiding real bugs
-        print(f"[chatbot] ask_gemini failed: {type(e).__name__}: {e}", flush=True)
-        return JSONResponse({"reply": FALLBACK})
+    # Fresh conversation? Serve repeat questions from cache (instant, no quota burn).
+    use_cache = len(hist) <= 2
+    raw = cache_get(msg) if use_cache else None
+    if raw is None:
+        try:
+            raw = await ask_gemini(hist, context, msg)
+        except Exception as e:
+            # logged to Render logs — silent fallback was hiding real bugs
+            print(f"[chatbot] ask_gemini failed: {type(e).__name__}: {e}", flush=True)
+            return JSONResponse({"reply": FALLBACK})
+        if use_cache:
+            cache_put(msg, raw)
+    else:
+        print("[chatbot] cache hit", flush=True)
 
     reply, lead = extract_lead(raw)
     hist.append({"role": "user", "text": msg})
