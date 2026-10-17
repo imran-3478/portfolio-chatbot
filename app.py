@@ -361,8 +361,11 @@ async def ask_gemini(history: list[dict], context: str, user_msg: str):
                       flush=True)
                 if name == "request_meeting" and result.get("ok"):
                     meeting = result["meeting"]
+                # NOTE: the generateContent API only accepts roles "user"/"model"
+                # (strictly alternating). Function results go as "user" —
+                # "function" role gets an instant 400 rejection.
                 body["contents"].append({
-                    "role": "function",
+                    "role": "user",
                     "parts": [{"functionResponse": {"name": name,
                                                     "response": result}}],
                 })
